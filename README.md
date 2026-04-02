@@ -1,78 +1,122 @@
-Вот отличный, структурированный `README.md` для твоего GitHub-репозитория. Я сделал его чистым, профессиональным и удобным для копирования команд.
 
------
 
 ````markdown
-# 🚀 VLESS + XTLS Reality: One-Command VPN Setup
+# 🚀 VLESS + XTLS Reality VPN
 
-The most advanced, high-performance, and censorship-resistant VPN protocol for 2026. This script automates the entire installation process on your Linux server.
-
----
-
-## 🛠 Features
-* **VLESS + Reality**: Invisible to DPI and ISP filtering.
-* **One-Command Setup**: No technical skills required.
-* **Optimized Performance**: Works perfectly on Ubuntu/Debian.
-* **Multi-Device Support**: Connect your Phone, PC, and TV.
+Fast, modern, and censorship-resistant VPN setup for your own VPS.  
+This script installs **VLESS + XTLS Reality** automatically and gives you a ready-to-use connection link in a few minutes.
 
 ---
 
-## 1. Get a Server (VPS)
-For the best experience and 99.9% uptime, we recommend these providers:
+## ✨ Features
 
-* 🌐 [**Contabo**](https://www.dpbolvw.net/click-101335050-17082114) (Best for high performance/price ratio)
-* ⚡ [**LumaDock**](https://lumadock.com/aff.php?aff=107) (Fast deployment and reliable nodes)
+- **VLESS + Reality** — modern protocol designed to work reliably under heavy filtering
+- **One-command install** — simple deployment on a fresh server
+- **Optimized for Ubuntu/Debian**
+- **Works on phone, PC, and tablet**
+- **Own private server** — no shared public VPN nodes
 
 ---
 
-## 2. Installation
-Connect to your server via SSH and run this single command:
+## 🖥️ Rent a VPS
+
+Choose any provider you like and deploy a fresh Ubuntu server.
+
+- 🌐 [Rent a VPS on Contabo](https://www.dpbolvw.net/click-101335050-17082114)
+- ⚡ [Rent a VPS on LumaDock](https://lumadock.com/aff.php?aff=107)
+
+> Recommended: Ubuntu 22.04 or Debian 12
+
+---
+
+## ⚙️ Installation
+
+Connect to your server via SSH and run:
 
 ```bash
-curl -L [https://raw.githubusercontent.com/VaniaHilkovets/VLESS-XTLS-Reality-VPN/main/vpn.sh](https://raw.githubusercontent.com/VaniaHilkovets/VLESS-XTLS-Reality-VPN/main/vpn.sh) -o vpn.sh && chmod +x vpn.sh && bash vpn.sh
+curl -L https://raw.githubusercontent.com/VaniaHilkovets/VLESS-XTLS-Reality-VPN/main/vpn.sh -o vpn.sh && chmod +x vpn.sh && bash vpn.sh
 ````
-
------
-
-## 3\. Connect Your Devices
-
-After the installation is complete, the script will output a **VLESS link**. Copy it and paste it into the **Hiddify** app on your device.
-
-### Download Hiddify Client:
-
-| Platform | Download Link |
-| :--- | :--- |
-| **Windows** | [Download from Microsoft Store](https://apps.microsoft.com/detail/9pdfnl3qv2s5) |
-| **Android** | [Download from Google Play](https://play.google.com/store/apps/details?id=app.hiddify.com) |
-| **iOS** | [Download from App Store](https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532) |
-
------
-
-## 📖 How to use
-
-1.  Run the **Installation Command** above.
-2.  **Copy the link** starting with `vless://` from the terminal output.
-3.  Open **Hiddify**, click **+ Add New Profile**, and select **Import from Clipboard**.
-4.  Click **Connect** and enjoy your digital freedom\!
-
------
-
-## Support & Links
-
-  * **Telegram**: [@Vania\_ls](https://www.google.com/search?q=https://t.me/Vania_ls)
-  * **Teletype**: [Vania\_ls Guides](https://teletype.in/@vania_ls)
-
-<!-- end list -->
-
-```
 
 ---
 
-### Почему это хороший README:
-1. **Секция VPS**: Твои реферальные ссылки органично вписаны. Пользователь сразу видит, где взять сервер.
-2. **Code Block**: Команда установки выделена так, чтобы ее можно было скопировать одним кликом в интерфейсе GitHub.
-3. **Таблица загрузок**: Ссылки на Hiddify оформлены в удобную таблицу, что выглядит намного лучше, чем просто список.
-4. **Инструкция**: Пошаговый гайд в конце гарантирует, что даже новичок разберется, куда вставлять ссылку.
+## 📋 What happens after installation
 
-Можешь просто создать файл `README.md` в своем репозитории `VLESS-XTLS-Reality-VPN` и вставить туда этот текст. 🔥
+After the script finishes, it will output your **VLESS link**.
+
+It will look similar to this:
+
+```text
+vless://...
+```
+
+Copy that link and import it into your client app.
+
+---
+
+## 📲 Client Apps
+
+Use **Hiddify** to connect from your device:
+
+| Platform      | App                                                                                           |
+| ------------- | --------------------------------------------------------------------------------------------- |
+| Windows       | [Download Hiddify for Windows](https://apps.microsoft.com/detail/9pdfnl3qv2s5)                |
+| Android       | [Download Hiddify for Android](https://play.google.com/store/apps/details?id=app.hiddify.com) |
+| iPhone / iPad | [Download Hiddify for iOS](https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532)      |
+
+---
+
+## 🧭 How to connect
+
+1. Rent a VPS
+2. Install Ubuntu or Debian
+3. Connect to the server via SSH
+4. Run the installation command
+5. Copy the generated `vless://...` link
+6. Open **Hiddify**
+7. Import the link
+8. Connect
+
+---
+
+## ✅ Recommended server requirements
+
+For personal use, even the cheapest VPS is usually enough.
+
+* **1 vCPU**
+* **1–2 GB RAM**
+* **10+ GB SSD**
+* **Ubuntu 22.04**
+
+---
+
+## 🔐 Why your own VPS
+
+Using your own server gives you:
+
+* better control
+* stable performance
+* private access
+* no overloaded public nodes
+* simple scaling if you want multiple devices
+
+---
+
+## 📞 Support
+
+* [Telegram](https://t.me/Vania_ls)
+* [Teletype Guides](https://teletype.in/@vania_ls)
+
+---
+
+## ⚠️ Disclaimer
+
+This project is provided for educational and personal infrastructure setup purposes.
+You are responsible for complying with the laws and regulations of your country.
+
+---
+
+## ⭐ If this project helped you
+
+Give the repository a star on GitHub — it helps a lot.
+
 ```

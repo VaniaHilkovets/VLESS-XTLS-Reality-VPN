@@ -1,20 +1,17 @@
-
-
-````markdown
 # 🚀 VLESS + XTLS Reality VPN
 
-Fast, modern, and censorship-resistant VPN setup for your own VPS.  
+Fast, modern, and censorship-resistant VPN setup for your own VPS.
 This script installs **VLESS + XTLS Reality** automatically and gives you a ready-to-use connection link in a few minutes.
 
 ---
 
 ## ✨ Features
 
-- **VLESS + Reality** — modern protocol designed to work reliably under heavy filtering
-- **One-command install** — simple deployment on a fresh server
-- **Optimized for Ubuntu/Debian**
-- **Works on phone, PC, and tablet**
-- **Own private server** — no shared public VPN nodes
+* **VLESS + Reality** — modern protocol designed to work reliably under heavy filtering
+* **One-command install** — simple deployment on a fresh server
+* **Optimized for Ubuntu/Debian**
+* **Works on phone, PC, and tablet**
+* **Own private server** — no shared public VPN nodes
 
 ---
 
@@ -22,8 +19,8 @@ This script installs **VLESS + XTLS Reality** automatically and gives you a read
 
 Choose any provider you like and deploy a fresh Ubuntu server.
 
-- 🌐 [Rent a VPS on Contabo](https://www.dpbolvw.net/click-101335050-17082114)
-- ⚡ [Rent a VPS on LumaDock](https://lumadock.com/aff.php?aff=107)
+* 🌐 [Rent a VPS on Contabo](https://www.dpbolvw.net/click-101335050-17082114)
+* ⚡ [Rent a VPS on LumaDock](https://lumadock.com/aff.php?aff=107)
 
 > Recommended: Ubuntu 22.04 or Debian 12
 
@@ -35,7 +32,7 @@ Connect to your server via SSH and run:
 
 ```bash
 curl -L https://raw.githubusercontent.com/VaniaHilkovets/VLESS-XTLS-Reality-VPN/main/vpn.sh -o vpn.sh && chmod +x vpn.sh && bash vpn.sh
-````
+```
 
 ---
 
@@ -45,9 +42,7 @@ After the script finishes, it will output your **VLESS link**.
 
 It will look similar to this:
 
-```text
-vless://...
-```
+`vless://...`
 
 Copy that link and import it into your client app.
 
@@ -85,7 +80,7 @@ For personal use, even the cheapest VPS is usually enough.
 * **1 vCPU**
 * **1–2 GB RAM**
 * **10+ GB SSD**
-* **Ubuntu 22.04**
+* **Ubuntu 22.04 / Debian 12**
 
 ---
 
@@ -101,22 +96,7 @@ Using your own server gives you:
 
 ---
 
-## 📞 Support
-
-* [Telegram](https://t.me/Vania_ls)
-* [Teletype Guides](https://teletype.in/@vania_ls)
-
----
-
-## ⚠️ Disclaimer
-
-This project is provided for educational and personal infrastructure setup purposes.
-You are responsible for complying with the laws and regulations of your country.
-
----
-
 ## ⭐ If this project helped you
 
 Give the repository a star on GitHub — it helps a lot.
 
-```

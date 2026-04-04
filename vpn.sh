@@ -18,16 +18,16 @@ INFO_FILE="/root/vpn-info.txt"
 LOG_FILE="/root/setup.log"
 XRAY_CMD="$(command -v xray 2>/dev/null || echo /usr/local/bin/xray)"
 SSH_PORT="22"
+PORT="443"
 
-# ── Root check ────────────────────────────────────────
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}Please run as root: sudo bash menu.sh${NC}"
+# ── Checks ────────────────────────────────────────────
+if [ "${EUID}" -ne 0 ]; then
+  echo -e "${RED}Run as root: sudo bash menu.sh${NC}"
   exit 1
 fi
 
-# ── OS check ──────────────────────────────────────────
 if [ ! -f /etc/debian_version ]; then
-  echo -e "${RED}Error: only Debian/Ubuntu are supported.${NC}"
+  echo -e "${RED}Only Debian/Ubuntu are supported.${NC}"
   exit 1
 fi
 
@@ -59,64 +59,9 @@ get_public_ip() {
   echo "$ip" | tr -d '[:space:]'
 }
 
-get_server_info() {
-  SERVER_IP="$(get_public_ip)"
-
-  if [ -f "$CONFIG" ]; then
-    PORT=$(python3 - <<PY 2>/dev/null || echo "443"
-import json
-with open("$CONFIG", "r") as f:
-    d = json.load(f)
-print(d["inbounds"][0]["port"])
-PY
-)
-
-    PRIVATE_KEY=$(python3 - <<PY 2>/dev/null || echo ""
-import json
-with open("$CONFIG", "r") as f:
-    d = json.load(f)
-print(d["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"])
-PY
-)
-
-    SHORT_ID=$(python3 - <<PY 2>/dev/null || echo ""
-import json
-with open("$CONFIG", "r") as f:
-    d = json.load(f)
-print(d["inbounds"][0]["streamSettings"]["realitySettings"]["shortIds"][0])
-PY
-)
-
-    TARGET=$(python3 - <<PY 2>/dev/null || echo ""
-import json
-with open("$CONFIG", "r") as f:
-    d = json.load(f)
-print(d["inbounds"][0]["streamSettings"]["realitySettings"]["serverNames"][0])
-PY
-)
-
-    UUID=$(python3 - <<PY 2>/dev/null || echo ""
-import json
-with open("$CONFIG", "r") as f:
-    d = json.load(f)
-print(d["inbounds"][0]["settings"]["clients"][0]["id"])
-PY
-)
-
-    get_xray_cmd
-    PUBLIC_KEY=$("$XRAY_CMD" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '/Public key/ {print $3}' | tr -d '[:space:]')
-  fi
-}
-
-make_link() {
-  local uuid="$1"
-  local label="${2:-MyVPN}"
-  echo "vless://${uuid}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision&headerType=none#${label}"
-}
-
-wait_xray() {
+wait_xray_active() {
   local i
-  for i in {1..10}; do
+  for i in {1..12}; do
     if systemctl is-active --quiet xray; then
       return 0
     fi
@@ -125,42 +70,95 @@ wait_xray() {
   return 1
 }
 
-# ══════════════════════════════════════════════════════
-#   1. INSTALL
-# ══════════════════════════════════════════════════════
+wait_xray_stopped() {
+  local i
+  for i in {1..12}; do
+    if ! systemctl is-active --quiet xray; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
-do_install() {
-  echo ""
-  echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${CYAN}║              Installing VLESS Reality            ║${NC}"
-  echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+json_get() {
+  local py="$1"
+  python3 - <<PY 2>/dev/null
+import json
+with open("$CONFIG","r") as f:
+    d = json.load(f)
+$py
+PY
+}
 
-  : > "$LOG_FILE"
-  exec > >(tee -a "$LOG_FILE") 2>&1
-
+get_server_info() {
   SERVER_IP="$(get_public_ip)"
-  if [ -z "$SERVER_IP" ]; then
-    echo -e "${RED}Error: cannot determine server IP.${NC}"
+  [ -f "$CONFIG" ] || return 0
+
+  PORT_CFG="$(json_get 'print(d["inbounds"][0]["port"])' || echo 443)"
+  UUID="$(json_get 'print(d["inbounds"][0]["settings"]["clients"][0]["id"])' || echo "")"
+  TARGET="$(json_get 'print(d["inbounds"][0]["streamSettings"]["realitySettings"]["serverNames"][0])' || echo "")"
+  PRIVATE_KEY="$(json_get 'print(d["inbounds"][0]["streamSettings"]["realitySettings"]["privateKey"])' || echo "")"
+  SHORT_ID="$(json_get 'print(d["inbounds"][0]["streamSettings"]["realitySettings"]["shortIds"][0])' || echo "")"
+
+  get_xray_cmd
+  PUBLIC_KEY="$("$XRAY_CMD" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '
+    /Public key/ {print $3}
+    /PublicKey/ {print $2}
+    /Password:/ {print $2}
+  ' | tail -n1 | tr -d "[:space:]")"
+}
+
+make_link() {
+  local uuid="$1"
+  local label="${2:-MyVPN}"
+  echo "vless://${uuid}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision&headerType=none#${label}"
+}
+
+generate_reality_keys() {
+  get_xray_cmd
+
+  local out priv pub
+  out="$("$XRAY_CMD" x25519 2>/dev/null || true)"
+
+  priv="$(echo "$out" | awk '
+    /Private key/ {print $3}
+    /PrivateKey/ {print $2}
+  ' | tail -n1 | tr -d "[:space:]")"
+
+  pub="$(echo "$out" | awk '
+    /Public key/ {print $3}
+    /PublicKey/ {print $2}
+    /Password:/ {print $2}
+  ' | tail -n1 | tr -d "[:space:]")"
+
+  if [ -n "$priv" ] && [ -z "$pub" ]; then
+    pub="$("$XRAY_CMD" x25519 -i "$priv" 2>/dev/null | awk '
+      /Public key/ {print $3}
+      /PublicKey/ {print $2}
+      /Password:/ {print $2}
+    ' | tail -n1 | tr -d "[:space:]")"
+  fi
+
+  PRIVATE_KEY="$priv"
+  PUBLIC_KEY="$pub"
+
+  if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
     return 1
   fi
-  echo -e "${GREEN}▶ Server IP   : ${SERVER_IP}${NC}"
+  return 0
+}
 
-  PORT="443"
-  if ss -ltnp 2>/dev/null | grep -q ":${PORT} "; then
-    echo -e "${RED}Error: port 443 is already in use. Stop the service and retry.${NC}"
-    ss -ltnp | grep ":${PORT} "
-    return 1
-  fi
-  echo -e "${GREEN}▶ VPN port    : ${PORT}${NC}"
-  echo -e "${GREEN}▶ SSH port    : ${SSH_PORT}${NC}"
-
+ensure_packages() {
   echo -e "${YELLOW}▶ Installing packages...${NC}"
   apt-get update -qq
   apt-get install -y -qq \
     curl unzip openssl netcat-openbsd qrencode ufw fail2ban \
-    unattended-upgrades ca-certificates python3 lsb-release >/dev/null
+    unattended-upgrades ca-certificates python3 >/dev/null
   echo -e "${GREEN}▶ Packages installed${NC}"
+}
 
+setup_ufw() {
   echo -e "${YELLOW}▶ Configuring UFW...${NC}"
   [ -f /etc/default/ufw ] && sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw || true
   ufw --force reset >/dev/null 2>&1
@@ -170,7 +168,9 @@ do_install() {
   ufw allow 443/tcp comment 'VLESS-Reality'
   ufw --force enable >/dev/null
   echo -e "${GREEN}▶ UFW active (SSH:22, VPN:443)${NC}"
+}
 
+setup_fail2ban() {
   echo -e "${YELLOW}▶ Configuring Fail2Ban...${NC}"
   cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -190,7 +190,9 @@ EOF
   systemctl enable fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban
   echo -e "${GREEN}▶ Fail2Ban active${NC}"
+}
 
+setup_auto_updates() {
   echo -e "${YELLOW}▶ Enabling auto security updates...${NC}"
   cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
@@ -198,7 +200,9 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
   echo -e "${GREEN}▶ Auto security updates enabled${NC}"
+}
 
+setup_sysctl() {
   echo -e "${YELLOW}▶ Applying kernel tuning...${NC}"
   sed -i '/# --- vless-setup-start ---/,/# --- vless-setup-end ---/d' /etc/sysctl.conf
   cat >> /etc/sysctl.conf <<'EOF'
@@ -216,7 +220,9 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
   sysctl -p >/dev/null 2>&1 || true
   echo -e "${GREEN}▶ Kernel hardening + BBR enabled${NC}"
+}
 
+install_xray() {
   echo -e "${YELLOW}▶ Installing Xray...${NC}"
   bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install >/dev/null
   get_xray_cmd
@@ -225,43 +231,30 @@ EOF
     return 1
   fi
   echo -e "${GREEN}▶ Xray installed${NC}"
+}
 
-  echo -e "${YELLOW}▶ Generating keys...${NC}"
-  KEYS=$("$XRAY_CMD" x25519)
-  PRIVATE_KEY=$(echo "$KEYS" | awk '/Private key/ {print $3}' | tr -d '[:space:]')
-  PUBLIC_KEY=$(echo "$KEYS" | awk '/Public key/ {print $3}' | tr -d '[:space:]')
-  UUID=$("$XRAY_CMD" uuid | tr -d '[:space:]')
-  SHORT_ID=$(openssl rand -hex 8 | tr -d '[:space:]')
-
-  if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ] || [ -z "$UUID" ] || [ -z "$SHORT_ID" ]; then
-    echo -e "${RED}Error: failed to generate Reality credentials.${NC}"
-    return 1
-  fi
-
+pick_target() {
   echo -e "${YELLOW}▶ Selecting SNI target...${NC}"
-  TARGETS=(
+  local targets target
+  targets=(
     "www.microsoft.com"
     "www.cloudflare.com"
     "www.apple.com"
     "www.amazon.com"
   )
-
   TARGET=""
-  for t in "${TARGETS[@]}"; do
-    if nc -z -w3 "$t" 443 >/dev/null 2>&1; then
-      TARGET="$t"
+  for target in "${targets[@]}"; do
+    if nc -z -w3 "$target" 443 >/dev/null 2>&1; then
+      TARGET="$target"
       break
     fi
   done
-
-  if [ -z "$TARGET" ]; then
-    TARGET="www.microsoft.com"
-  fi
+  [ -n "$TARGET" ] || TARGET="www.microsoft.com"
   echo -e "${GREEN}▶ SNI target  : ${TARGET}${NC}"
+}
 
+write_xray_config() {
   mkdir -p "$(dirname "$CONFIG")"
-
-  echo -e "${YELLOW}▶ Writing Xray config...${NC}"
   cat > "$CONFIG" <<EOF
 {
   "log": {
@@ -319,31 +312,109 @@ EOF
   ]
 }
 EOF
+}
 
+setup_xray_restart_policy() {
   mkdir -p /etc/systemd/system/xray.service.d
   cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
 [Service]
 Restart=always
 RestartSec=5
 EOF
-
   systemctl daemon-reload
+}
+
+show_current_link() {
+  if [ ! -f "$CONFIG" ]; then
+    echo -e "${RED}Config not found.${NC}"
+    return 1
+  fi
+
+  get_server_info
+  if [ -z "${UUID:-}" ] || [ -z "${PUBLIC_KEY:-}" ] || [ -z "${SHORT_ID:-}" ] || [ -z "${TARGET:-}" ] || [ -z "${SERVER_IP:-}" ]; then
+    echo -e "${RED}Failed to build current link.${NC}"
+    return 1
+  fi
+
+  echo ""
+  echo -e "${CYAN}Current link:${NC}"
+  echo -e "${BOLD}${GREEN}$(make_link "$UUID" "MyVPN")${NC}"
+  echo ""
+}
+
+# ══════════════════════════════════════════════════════
+#   ACTIONS
+# ══════════════════════════════════════════════════════
+
+do_install_and_start() {
+  echo ""
+  echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+  echo -e "${CYAN}║         Installing + Starting VLESS Reality     ║${NC}"
+  echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+
+  : > "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+
+  SERVER_IP="$(get_public_ip)"
+  if [ -z "$SERVER_IP" ]; then
+    echo -e "${RED}Error: cannot determine server IP.${NC}"
+    return 1
+  fi
+
+  echo -e "${GREEN}▶ Server IP   : ${SERVER_IP}${NC}"
+  echo -e "${GREEN}▶ VPN port    : ${PORT}${NC}"
+  echo -e "${GREEN}▶ SSH port    : ${SSH_PORT}${NC}"
+
+  if ss -ltnp 2>/dev/null | grep -q ":${PORT} "; then
+    echo -e "${RED}Error: port 443 is already in use.${NC}"
+    ss -ltnp | grep ":${PORT} "
+    return 1
+  fi
+
+  ensure_packages || return 1
+  setup_ufw || return 1
+  setup_fail2ban || return 1
+  setup_auto_updates || return 1
+  setup_sysctl || return 1
+  install_xray || return 1
+
+  echo -e "${YELLOW}▶ Generating Reality keys...${NC}"
+  if ! generate_reality_keys; then
+    echo -e "${RED}Error: failed to generate Reality credentials.${NC}"
+    echo -e "${YELLOW}Debug:${NC}"
+    "$XRAY_CMD" version 2>/dev/null || true
+    "$XRAY_CMD" x25519 2>/dev/null || true
+    return 1
+  fi
+  echo -e "${GREEN}▶ Reality keys generated${NC}"
+
+  UUID="$("$XRAY_CMD" uuid 2>/dev/null | tr -d '[:space:]')"
+  SHORT_ID="$(openssl rand -hex 8 | tr -d '[:space:]')"
+
+  if [ -z "$UUID" ] || [ -z "$SHORT_ID" ]; then
+    echo -e "${RED}Error: failed to generate UUID or Short ID.${NC}"
+    return 1
+  fi
+
+  pick_target
+  write_xray_config
+  setup_xray_restart_policy
+
+  echo -e "${YELLOW}▶ Starting Xray...${NC}"
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
 
-  if ! wait_xray; then
+  if ! wait_xray_active; then
     echo -e "${RED}Error: Xray failed to start.${NC}"
     journalctl -u xray -n 50 --no-pager
     return 1
   fi
 
   if ! ss -ltnp 2>/dev/null | grep -q ":443 "; then
-    echo -e "${RED}Error: Xray is running but 443 is not listening.${NC}"
+    echo -e "${RED}Error: Xray is running but port 443 is not listening.${NC}"
     journalctl -u xray -n 50 --no-pager
     return 1
   fi
-
-  echo -e "${GREEN}▶ Xray started${NC}"
 
   VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision&headerType=none#MyVPN"
 
@@ -374,7 +445,7 @@ EOF
 
   echo ""
   echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${CYAN}║           ✅ Installation complete!              ║${NC}"
+  echo -e "${CYAN}║          ✅ Installed and started!               ║${NC}"
   echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "${BOLD}${GREEN}${VLESS_LINK}${NC}"
@@ -386,69 +457,29 @@ EOF
   echo -e "${CYAN}📁 Details : ${BOLD}${INFO_FILE}${NC}"
   echo -e "${CYAN}📋 Log     : ${BOLD}${LOG_FILE}${NC}"
   echo ""
-  echo -e "${GREEN}Security:${NC}"
-  echo "   ✅ UFW          — only SSH 22 and VPN 443"
-  echo "   ✅ Fail2Ban     — SSH protection enabled"
-  echo "   ✅ BBR          — enabled"
-  echo "   ✅ Auto-updates — enabled"
-  echo "   ✅ Watchdog     — xray auto-restart enabled"
+}
+
+do_stop() {
   echo ""
-}
+  echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+  echo -e "${CYAN}║                  Stopping Xray                   ║${NC}"
+  echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
 
-# ══════════════════════════════════════════════════════
-#   2. START
-# ══════════════════════════════════════════════════════
-
-do_start() {
   if ! xray_installed; then
-    echo -e "${RED}Xray is not installed. Run option 1 first.${NC}"
+    echo -e "${RED}Xray is not installed.${NC}"
     return 1
   fi
 
-  systemctl start xray
+  systemctl stop xray
 
-  if wait_xray; then
-    echo -e "${GREEN}▶ Xray started successfully.${NC}"
-    if [ -f "$CONFIG" ]; then
-      get_server_info
-      echo ""
-      echo -e "${CYAN}Your connection link:${NC}"
-      echo -e "${BOLD}${GREEN}$(make_link "$UUID" "MyVPN")${NC}"
-    fi
+  if wait_xray_stopped; then
+    echo -e "${GREEN}▶ Xray stopped successfully.${NC}"
   else
-    echo -e "${RED}Error: Xray failed to start.${NC}"
-    journalctl -u xray -n 50 --no-pager
-  fi
-}
-
-# ══════════════════════════════════════════════════════
-#   3. RESTART
-# ══════════════════════════════════════════════════════
-
-do_restart() {
-  if ! xray_installed; then
-    echo -e "${RED}Xray is not installed. Run option 1 first.${NC}"
+    echo -e "${RED}Error: failed to stop Xray.${NC}"
+    systemctl status xray --no-pager -l || true
     return 1
   fi
-
-  systemctl restart xray
-
-  if wait_xray; then
-    echo -e "${GREEN}▶ Xray restarted successfully.${NC}"
-    if [ -f "$CONFIG" ]; then
-      get_server_info
-      echo -e "${CYAN}Current link:${NC}"
-      echo -e "${BOLD}${GREEN}$(make_link "$UUID" "MyVPN")${NC}"
-    fi
-  else
-    echo -e "${RED}Error: Xray failed to restart.${NC}"
-    journalctl -u xray -n 50 --no-pager
-  fi
 }
-
-# ══════════════════════════════════════════════════════
-#   4. UNINSTALL
-# ══════════════════════════════════════════════════════
 
 do_uninstall() {
   echo ""
@@ -458,6 +489,7 @@ do_uninstall() {
 
   systemctl stop xray 2>/dev/null || true
   systemctl disable xray 2>/dev/null || true
+
   rm -rf /etc/systemd/system/xray.service.d
   systemctl daemon-reload
 
@@ -479,7 +511,7 @@ do_uninstall() {
 }
 
 # ══════════════════════════════════════════════════════
-#   MAIN MENU LOOP
+#   MENU
 # ══════════════════════════════════════════════════════
 
 while true; do
@@ -494,19 +526,17 @@ while true; do
   fi
 
   echo ""
-  echo "   1)  Install"
-  echo "   2)  Start"
-  echo "   3)  Restart"
-  echo "   4)  Uninstall"
+  echo "   1)  Install + Start"
+  echo "   2)  Stop"
+  echo "   3)  Uninstall"
   echo "   0)  Exit"
   echo ""
   read -rp "$(echo -e "${YELLOW}  Choice: ${NC}")" MENU_CHOICE
 
   case "$MENU_CHOICE" in
-    1) do_install ;;
-    2) do_start ;;
-    3) do_restart ;;
-    4) do_uninstall ;;
+    1) do_install_and_start ;;
+    2) do_stop ;;
+    3) do_uninstall ;;
     0) echo "Bye."; exit 0 ;;
     *) echo -e "${RED}Unknown option.${NC}" ;;
   esac

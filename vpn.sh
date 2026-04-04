@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # ═══════════════════════════════════════════════════════════════
-#              VLESS + XTLS-Reality AUTO-SETUP
+#   VLESS + XTLS-Reality AUTO-SETUP + SECURITY  (DPI-hardened)
+#   Menu: install / start / stop / restart / show link
+#         regenerate keys / uninstall / exit
 # ═══════════════════════════════════════════════════════════════
 
 set -uo pipefail
@@ -21,7 +23,8 @@ LOG_FILE="/root/setup.log"
 XRAY_CMD=""
 SELF_PATH="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
 
-# ── Port range (high random port to avoid DPI on 443) ────────
+# ── Port settings ─────────────────────────────────────────────
+DEFAULT_PORT=443
 PORT_MIN=47000
 PORT_MAX=60000
 
@@ -89,6 +92,18 @@ wait_xray_stopped() {
   local i
   for i in $(seq 1 15); do
     systemctl is-active --quiet xray || return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Wait for a port to actually start listening (Xray needs a moment after systemd reports active)
+wait_port_listening() {
+  local port="$1" i
+  for i in $(seq 1 10); do
+    if ss -ltnp 2>/dev/null | grep -q ":${port} "; then
+      return 0
+    fi
     sleep 1
   done
   return 1
@@ -428,6 +443,7 @@ setup_xray_service() {
   mkdir -p /etc/systemd/system/xray.service.d
   cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
 [Service]
+User=root
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -508,9 +524,48 @@ do_install() {
     return 1
   fi
 
-  PORT="$(random_port)"
+  # ── Port selection ──────────────────────────────────────
+  echo ""
+  echo -e "${CYAN}  Port selection:${NC}"
+  echo -e "    1) ${BOLD}443${NC}  — standard HTTPS (${GREEN}recommended${NC}, best camouflage)"
+  echo -e "    2) Random high port (${PORT_MIN}-${PORT_MAX})"
+  echo -e "    3) Enter custom port"
+  echo ""
+  read -rp "$(echo -e "${YELLOW}  Choice [1]: ${NC}")" port_choice
+
+  case "${port_choice:-1}" in
+    1|"")
+      PORT="$DEFAULT_PORT"
+      if ss -ltnp 2>/dev/null | grep -q ":${PORT} "; then
+        echo -e "${RED}  ✗ Port 443 is already in use:${NC}"
+        ss -ltnp | grep ":${PORT} "
+        echo -e "${YELLOW}  Falling back to random port...${NC}"
+        PORT="$(random_port)"
+      fi
+      ;;
+    2)
+      PORT="$(random_port)"
+      ;;
+    3)
+      read -rp "$(echo -e "${YELLOW}  Enter port number: ${NC}")" custom_port
+      if [[ "$custom_port" =~ ^[0-9]+$ ]] && [ "$custom_port" -ge 1 ] && [ "$custom_port" -le 65535 ]; then
+        if ss -ltnp 2>/dev/null | grep -q ":${custom_port} "; then
+          echo -e "${RED}  ✗ Port ${custom_port} is already in use.${NC}"
+          return 1
+        fi
+        PORT="$custom_port"
+      else
+        echo -e "${RED}  ✗ Invalid port.${NC}"
+        return 1
+      fi
+      ;;
+    *)
+      PORT="$DEFAULT_PORT"
+      ;;
+  esac
+
   echo -e "${GREEN}  ▸ Server IP  : ${SERVER_IP}${NC}"
-  echo -e "${GREEN}  ▸ VPN port   : ${PORT}  (random high port)${NC}"
+  echo -e "${GREEN}  ▸ VPN port   : ${PORT}${NC}"
 
   ensure_packages    || return 1
   setup_ufw "$PORT"  || return 1
@@ -551,8 +606,8 @@ do_install() {
     return 1
   fi
 
-  if ! ss -ltnp 2>/dev/null | grep -q ":${PORT} "; then
-    echo -e "${RED}  ✗ Port ${PORT} is not listening.${NC}"
+  if ! wait_port_listening "$PORT"; then
+    echo -e "${RED}  ✗ Port ${PORT} is not listening after 10s.${NC}"
     journalctl -u xray -n 30 --no-pager
     return 1
   fi
@@ -691,13 +746,37 @@ do_change_port() {
   local old_port="$PORT"
 
   echo -e "${YELLOW}Current port: ${old_port}${NC}"
-  echo -e "${YELLOW}A new random port (${PORT_MIN}-${PORT_MAX}) will be selected.${NC}"
-  read -rp "$(echo -e "${YELLOW}Continue? [y/N]: ${NC}")" ans
-  [[ "${ans,,}" != "y" ]] && { echo "Cancelled."; return 0; }
+  echo ""
+  echo -e "${CYAN}  New port:${NC}"
+  echo -e "    1) ${BOLD}443${NC}  — standard HTTPS (best camouflage)"
+  echo -e "    2) Random high port (${PORT_MIN}-${PORT_MAX})"
+  echo -e "    3) Enter custom port"
+  echo ""
+  read -rp "$(echo -e "${YELLOW}  Choice [1]: ${NC}")" pc
 
-  local new_port
-  new_port="$(random_port)"
-  PORT="$new_port"
+  case "${pc:-1}" in
+    1|"")
+      PORT="$DEFAULT_PORT"
+      ;;
+    2)
+      PORT="$(random_port)"
+      ;;
+    3)
+      read -rp "$(echo -e "${YELLOW}  Enter port: ${NC}")" cp
+      if [[ "$cp" =~ ^[0-9]+$ ]] && [ "$cp" -ge 1 ] && [ "$cp" -le 65535 ]; then
+        PORT="$cp"
+      else
+        echo -e "${RED}  ✗ Invalid port.${NC}"
+        return 1
+      fi
+      ;;
+    *) PORT="$DEFAULT_PORT" ;;
+  esac
+
+  if [ "$PORT" = "$old_port" ]; then
+    echo -e "${YELLOW}  Same port — nothing to change.${NC}"
+    return 0
+  fi
 
   write_xray_config "$PORT" "$UUID" "$TARGET" "$PRIVATE_KEY"
 

@@ -1,9 +1,7 @@
 #!/bin/bash
 
 # ═══════════════════════════════════════════════════════════════
-#   VLESS + XTLS-Reality AUTO-SETUP + SECURITY  (DPI-hardened)
-#   Menu: install / start / stop / restart / show link
-#         regenerate keys / uninstall / exit
+#              VLESS + XTLS-Reality AUTO-SETUP
 # ═══════════════════════════════════════════════════════════════
 
 set -uo pipefail
@@ -16,24 +14,31 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ── Paths ─────────────────────────────────────────────────────
+# ── Paths & defaults ─────────────────────────────────────────
 CONFIG="/usr/local/etc/xray/config.json"
+STATE_FILE="/root/.vless-state"
 INFO_FILE="/root/vpn-info.txt"
 LOG_FILE="/root/setup.log"
 XRAY_CMD=""
 SELF_PATH="$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
-
-# ── Port settings ─────────────────────────────────────────────
 DEFAULT_PORT=443
 PORT_MIN=47000
 PORT_MAX=60000
 
-# ── Checks ────────────────────────────────────────────────────
+# ── Variables (filled at runtime) ─────────────────────────────
+SERVER_IP=""
+PORT=""
+UUID=""
+TARGET=""
+PRIVATE_KEY=""
+PUBLIC_KEY=""
+SHORT_ID=""
+
+# ── Root & OS check ──────────────────────────────────────────
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo -e "${RED}Run as root: sudo bash $(basename "$0")${NC}"
   exit 1
 fi
-
 if [ ! -f /etc/debian_version ]; then
   echo -e "${RED}Only Debian / Ubuntu are supported.${NC}"
   exit 1
@@ -48,7 +53,7 @@ log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"; }
 print_header() {
   echo ""
   echo -e "${CYAN}╔═══════════════════════════════════════════════════╗${NC}"
-  echo -e "${CYAN}║    VLESS + Reality — Management Menu (hardened)   ║${NC}"
+  echo -e "${CYAN}║         VLESS + Reality — Management Menu        ║${NC}"
   echo -e "${CYAN}╚═══════════════════════════════════════════════════╝${NC}"
 }
 
@@ -72,7 +77,6 @@ get_public_ip() {
 random_port() {
   local port
   port=$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n1)
-  # make sure it's not already taken
   while ss -ltnp 2>/dev/null | grep -q ":${port} "; do
     port=$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n1)
   done
@@ -97,7 +101,6 @@ wait_xray_stopped() {
   return 1
 }
 
-# Wait for a port to actually start listening (Xray needs a moment after systemd reports active)
 wait_port_listening() {
   local port="$1" i
   for i in $(seq 1 10); do
@@ -109,18 +112,16 @@ wait_port_listening() {
   return 1
 }
 
-# ── JSON helpers (jq first, python3 fallback) ─────────────────
+# ── JSON helper (jq first, python3 fallback) ──────────────────
 json_val() {
-  # usage: json_val '.inbounds[0].port'
   local jpath="$1"
   if command -v jq >/dev/null 2>&1; then
     jq -r "$jpath" "$CONFIG" 2>/dev/null
   else
     python3 -c "
-import json, functools, operator
+import json
 with open('$CONFIG') as f:
     d = json.load(f)
-# translate jq path to python
 path = '$jpath'.lstrip('.').replace('][','|').replace('[','|').replace(']','').split('|')
 ref = d
 for p in path:
@@ -133,66 +134,147 @@ print(ref)
   fi
 }
 
-# ── Read all values from running config ───────────────────────
+# ══════════════════════════════════════════════════════════════
+#   STATE MANAGEMENT
+#   Instead of re-deriving public key every time (fragile),
+#   we save all connection params to a state file.
+# ══════════════════════════════════════════════════════════════
+
+save_state() {
+  cat > "$STATE_FILE" <<EOF
+PORT=${PORT}
+UUID=${UUID}
+TARGET=${TARGET}
+PRIVATE_KEY=${PRIVATE_KEY}
+PUBLIC_KEY=${PUBLIC_KEY}
+SHORT_ID=${SHORT_ID}
+EOF
+  chmod 600 "$STATE_FILE"
+}
+
+load_state() {
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    return 0
+  fi
+  return 1
+}
+
 get_server_info() {
   SERVER_IP="$(get_public_ip)"
-  [ -f "$CONFIG" ] || return 0
 
-  PORT="$(json_val '.inbounds[0].port')" || PORT=""
-  UUID="$(json_val '.inbounds[0].settings.clients[0].id')" || UUID=""
-  TARGET="$(json_val '.inbounds[0].streamSettings.realitySettings.serverNames[0]')" || TARGET=""
-  PRIVATE_KEY="$(json_val '.inbounds[0].streamSettings.realitySettings.privateKey')" || PRIVATE_KEY=""
-  SHORT_ID="$(json_val '.inbounds[0].streamSettings.realitySettings.shortIds[0]')" || SHORT_ID=""
+  # Try state file first (reliable)
+  if load_state; then
+    return 0
+  fi
 
-  refresh_xray_cmd
-  if [ -n "$PRIVATE_KEY" ]; then
-    PUBLIC_KEY="$("$XRAY_CMD" x25519 -i "$PRIVATE_KEY" 2>/dev/null | awk '
-      /Public key/ {print $3}
-      /PublicKey/  {print $2}
-      /Password:/  {print $2}
-    ' | tail -n1 | tr -d '[:space:]')"
-  else
-    PUBLIC_KEY=""
+  # Fallback: parse from config (for upgrades from old script)
+  if [ -f "$CONFIG" ]; then
+    PORT="$(json_val '.inbounds[0].port')" || PORT=""
+    UUID="$(json_val '.inbounds[0].settings.clients[0].id')" || UUID=""
+    TARGET="$(json_val '.inbounds[0].streamSettings.realitySettings.serverNames[0]')" || TARGET=""
+    PRIVATE_KEY="$(json_val '.inbounds[0].streamSettings.realitySettings.privateKey')" || PRIVATE_KEY=""
+
+    # Get first non-empty shortId
+    SHORT_ID="$(json_val '.inbounds[0].streamSettings.realitySettings.shortIds[0]')" || SHORT_ID=""
+    if [ -z "$SHORT_ID" ]; then
+      SHORT_ID="$(json_val '.inbounds[0].streamSettings.realitySettings.shortIds[1]')" || SHORT_ID=""
+    fi
+
+    # Try to derive public key
+    if [ -n "$PRIVATE_KEY" ]; then
+      refresh_xray_cmd
+      local raw
+      raw="$("$XRAY_CMD" x25519 -i "$PRIVATE_KEY" 2>/dev/null || true)"
+      PUBLIC_KEY="$(echo "$raw" | tail -1 | awk '{print $NF}' | tr -d '[:space:]')"
+      log "Fallback derive: raw=$raw  result=$PUBLIC_KEY"
+    fi
+
+    # Save state for future use
+    if [ -n "$PUBLIC_KEY" ] && [ -n "$UUID" ]; then
+      save_state
+    fi
   fi
 }
 
 make_link() {
   local uuid="${1}" label="${2:-MyVPN}"
-  # No flow parameter — intentionally omitted to avoid Vision fingerprinting
+
+  if [ -z "${PUBLIC_KEY:-}" ]; then
+    echo -e "${RED}  ✗ PUBLIC_KEY is empty — cannot generate link.${NC}" >&2
+    echo -e "${RED}    Check ${LOG_FILE} for debug info.${NC}" >&2
+    return 1
+  fi
+  if [ -z "${SHORT_ID:-}" ]; then
+    echo -e "${RED}  ✗ SHORT_ID is empty — cannot generate link.${NC}" >&2
+    return 1
+  fi
+
   echo "vless://${uuid}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${label}"
 }
 
-# ── Reality key generation ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+#   KEY GENERATION
+# ══════════════════════════════════════════════════════════════
+
 generate_reality_keys() {
   refresh_xray_cmd
 
-  local out priv pub
-  out="$("$XRAY_CMD" x25519 2>/dev/null || true)"
+  local raw_output=""
+  raw_output="$("$XRAY_CMD" x25519 2>&1 || true)"
 
-  priv="$(echo "$out" | awk '
-    /Private key/ {print $3}
-    /PrivateKey/  {print $2}
-  ' | tail -n1 | tr -d '[:space:]')"
+  log "=== x25519 raw output START ==="
+  log "$raw_output"
+  log "=== x25519 raw output END ==="
 
-  pub="$(echo "$out" | awk '
-    /Public key/ {print $3}
-    /PublicKey/  {print $2}
-    /Password:/  {print $2}
-  ' | tail -n1 | tr -d '[:space:]')"
+  # xray x25519 outputs exactly 2 lines:
+  #   Private key: XXXXX
+  #   Public key: YYYYY
+  # OR:
+  #   PrivateKey: XXXXX
+  #   PublicKey: YYYYY
+  #
+  # Strategy: just take the LAST token on each line.
 
-  # some xray builds only print private; derive public
-  if [ -n "$priv" ] && [ -z "$pub" ]; then
-    pub="$("$XRAY_CMD" x25519 -i "$priv" 2>/dev/null | awk '
-      /Public key/ {print $3}
-      /PublicKey/  {print $2}
-      /Password:/  {print $2}
-    ' | tail -n1 | tr -d '[:space:]')"
+  local line1 line2
+  line1="$(echo "$raw_output" | head -1)"
+  line2="$(echo "$raw_output" | head -2 | tail -1)"
+
+  PRIVATE_KEY="$(echo "$line1" | awk '{print $NF}' | tr -d '[:space:]')"
+  PUBLIC_KEY="$(echo "$line2" | awk '{print $NF}' | tr -d '[:space:]')"
+
+  log "Parsed PRIVATE_KEY=${PRIVATE_KEY}"
+  log "Parsed PUBLIC_KEY=${PUBLIC_KEY}"
+
+  # Validate: keys should be 43-44 chars of base64url
+  if [ -z "$PRIVATE_KEY" ] || [ ${#PRIVATE_KEY} -lt 40 ]; then
+    echo -e "${RED}  ✗ Private key looks invalid (len=${#PRIVATE_KEY}): '${PRIVATE_KEY}'${NC}"
+    echo -e "${RED}  Raw output:${NC}"
+    echo "$raw_output"
+    return 1
   fi
 
-  PRIVATE_KEY="$priv"
-  PUBLIC_KEY="$pub"
+  if [ -z "$PUBLIC_KEY" ] || [ ${#PUBLIC_KEY} -lt 40 ]; then
+    echo -e "${YELLOW}  ⚠ Public key from initial output looks bad, deriving from private...${NC}"
+    local derive_out
+    derive_out="$("$XRAY_CMD" x25519 -i "$PRIVATE_KEY" 2>&1 || true)"
+    log "Derive output: $derive_out"
+    PUBLIC_KEY="$(echo "$derive_out" | tail -1 | awk '{print $NF}' | tr -d '[:space:]')"
+    log "Derived PUBLIC_KEY=${PUBLIC_KEY}"
+  fi
 
-  [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ]
+  if [ -z "$PUBLIC_KEY" ] || [ ${#PUBLIC_KEY} -lt 40 ]; then
+    echo -e "${RED}  ✗ Public key generation failed.${NC}"
+    echo -e "${RED}  Private key: ${PRIVATE_KEY}${NC}"
+    echo -e "${RED}  Raw derive output:${NC}"
+    "$XRAY_CMD" x25519 -i "$PRIVATE_KEY" 2>&1 || true
+    return 1
+  fi
+
+  echo -e "${GREEN}  ✓ Private key: ${PRIVATE_KEY:0:8}...${NC}"
+  echo -e "${GREEN}  ✓ Public key:  ${PUBLIC_KEY:0:8}...${NC}"
+  return 0
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -211,32 +293,19 @@ ensure_packages() {
 setup_ufw() {
   local vpn_port="$1"
   echo -e "${YELLOW}▶ Configuring UFW...${NC}"
-
-  # enable IPv6
   [ -f /etc/default/ufw ] && sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
-
-  # only touch our own rules, don't reset the whole table
   ufw default deny incoming  >/dev/null 2>&1
   ufw default allow outgoing >/dev/null 2>&1
-
-  # SSH — always allow
   ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1
-
-  # VPN port
   ufw allow "${vpn_port}/tcp" comment 'VLESS-Reality' >/dev/null 2>&1
-
   ufw --force enable >/dev/null 2>&1
   echo -e "${GREEN}  ✓ UFW active  (SSH: 22,  VPN: ${vpn_port})${NC}"
 }
 
-# Remove old VPN port from UFW when changing ports
 cleanup_old_ufw_vpn() {
-  # delete any rules with our comment that are NOT the new port
   local new_port="$1"
-  ufw status numbered 2>/dev/null | grep 'VLESS-Reality' | while read -r line; do
-    local rule_port
-    rule_port="$(echo "$line" | grep -oP '\d+(?=/tcp)' | head -1)"
-    if [ -n "$rule_port" ] && [ "$rule_port" != "$new_port" ]; then
+  ufw status numbered 2>/dev/null | grep 'VLESS-Reality' | grep -oP '\d+(?=/tcp)' | while read -r rule_port; do
+    if [ "$rule_port" != "$new_port" ]; then
       ufw delete allow "${rule_port}/tcp" >/dev/null 2>&1 || true
     fi
   done
@@ -277,7 +346,6 @@ EOF
 setup_sysctl() {
   echo -e "${YELLOW}▶ Applying kernel tuning...${NC}"
   sed -i '/# --- vless-setup-start ---/,/# --- vless-setup-end ---/d' /etc/sysctl.conf
-
   cat >> /etc/sysctl.conf <<'EOF'
 
 # --- vless-setup-start ---
@@ -315,12 +383,8 @@ install_xray() {
   return 1
 }
 
-# ── SNI target selection ──────────────────────────────────────
-# Using less obvious targets that are not commonly associated
-# with proxy detection lists and are unlikely to be whitelisted.
 pick_target() {
   echo -e "${YELLOW}▶ Selecting SNI target...${NC}"
-
   local targets=(
     "gateway.icloud.com"
     "swcdn.apple.com"
@@ -329,9 +393,7 @@ pick_target() {
     "packages.microsoft.com"
     "cdn.steamstatic.com"
     "updates.cdn-apple.com"
-    "steamcdn-a.akamaihd.net"
   )
-
   TARGET=""
   for t in "${targets[@]}"; do
     if nc -z -w3 "$t" 443 >/dev/null 2>&1; then
@@ -343,19 +405,12 @@ pick_target() {
   echo -e "${GREEN}  ✓ SNI target: ${TARGET}${NC}"
 }
 
-# ── Write Xray config ────────────────────────────────────────
-# NOTE: "flow" is intentionally EMPTY — Vision flow has a known
-# fingerprint that ТСПУ / DPI can detect and block.
 write_xray_config() {
-  local port="$1" uuid="$2" target="$3" privkey="$4"
-  local sid1 sid2 sid3
+  local port="$1" uuid="$2" target="$3" privkey="$4" sid="$5"
 
-  sid1="$(openssl rand -hex 8)"
+  local sid2 sid3
   sid2="$(openssl rand -hex 8)"
   sid3="$(openssl rand -hex 4)"
-
-  # export first short id for link generation
-  SHORT_ID="$sid1"
 
   mkdir -p "$(dirname "$CONFIG")"
   cat > "$CONFIG" <<EOF
@@ -389,10 +444,10 @@ write_xray_config() {
           ],
           "privateKey": "${privkey}",
           "shortIds": [
-            "",
-            "${sid1}",
+            "${sid}",
             "${sid2}",
-            "${sid3}"
+            "${sid3}",
+            ""
           ]
         }
       },
@@ -455,7 +510,7 @@ save_info_file() {
   local link="$1"
   cat > "$INFO_FILE" <<EOF
 ════════════════════════════════════════════════════════
-  VLESS + XTLS-Reality — connection details (hardened)
+  VLESS + XTLS-Reality — connection details
 ════════════════════════════════════════════════════════
 
 Server IP    : ${SERVER_IP}
@@ -465,7 +520,7 @@ Public Key   : ${PUBLIC_KEY}
 Short ID     : ${SHORT_ID}
 SNI Target   : ${TARGET}
 Fingerprint  : chrome
-Flow         : (none — disabled for DPI evasion)
+Flow         : (none)
 Connections  : unlimited
 
 IMPORT LINK:
@@ -489,7 +544,8 @@ print_result() {
   echo -e "  ${BOLD}Server${NC}     : ${SERVER_IP}"
   echo -e "  ${BOLD}Port${NC}       : ${PORT}"
   echo -e "  ${BOLD}SNI${NC}        : ${TARGET}"
-  echo -e "  ${BOLD}Flow${NC}       : ${YELLOW}disabled (DPI evasion)${NC}"
+  echo -e "  ${BOLD}Public Key${NC} : ${PUBLIC_KEY}"
+  echo -e "  ${BOLD}Short ID${NC}   : ${SHORT_ID}"
   echo ""
   echo -e "${BOLD}${GREEN}${link}${NC}"
   echo ""
@@ -527,7 +583,7 @@ do_install() {
   # ── Port selection ──────────────────────────────────────
   echo ""
   echo -e "${CYAN}  Port selection:${NC}"
-  echo -e "    1) ${BOLD}443${NC}  — standard HTTPS (${GREEN}recommended${NC}, best camouflage)"
+  echo -e "    1) ${BOLD}443${NC}  — standard HTTPS (${GREEN}recommended${NC})"
   echo -e "    2) Random high port (${PORT_MIN}-${PORT_MAX})"
   echo -e "    3) Enter custom port"
   echo ""
@@ -537,8 +593,7 @@ do_install() {
     1|"")
       PORT="$DEFAULT_PORT"
       if ss -ltnp 2>/dev/null | grep -q ":${PORT} "; then
-        echo -e "${RED}  ✗ Port 443 is already in use:${NC}"
-        ss -ltnp | grep ":${PORT} "
+        echo -e "${RED}  ✗ Port 443 is already in use.${NC}"
         echo -e "${YELLOW}  Falling back to random port...${NC}"
         PORT="$(random_port)"
       fi
@@ -559,9 +614,7 @@ do_install() {
         return 1
       fi
       ;;
-    *)
-      PORT="$DEFAULT_PORT"
-      ;;
+    *) PORT="$DEFAULT_PORT" ;;
   esac
 
   echo -e "${GREEN}  ▸ Server IP  : ${SERVER_IP}${NC}"
@@ -576,14 +629,9 @@ do_install() {
 
   echo -e "${YELLOW}▶ Generating Reality keys...${NC}"
   if ! generate_reality_keys; then
-    echo -e "${RED}  ✗ Key generation failed.${NC}"
-    refresh_xray_cmd
-    echo "--- debug ---" >> "$LOG_FILE"
-    "$XRAY_CMD" version >> "$LOG_FILE" 2>&1 || true
-    "$XRAY_CMD" x25519  >> "$LOG_FILE" 2>&1 || true
+    echo -e "${RED}  ✗ Key generation failed. See above for details.${NC}"
     return 1
   fi
-  echo -e "${GREEN}  ✓ Reality keys generated${NC}"
 
   refresh_xray_cmd
   UUID="$("$XRAY_CMD" uuid 2>/dev/null | tr -d '[:space:]')"
@@ -592,9 +640,14 @@ do_install() {
     return 1
   fi
 
+  SHORT_ID="$(openssl rand -hex 8)"
+
   pick_target
-  write_xray_config "$PORT" "$UUID" "$TARGET" "$PRIVATE_KEY"
+  write_xray_config "$PORT" "$UUID" "$TARGET" "$PRIVATE_KEY" "$SHORT_ID"
   setup_xray_service
+
+  # Save state BEFORE starting (so we have the keys even if start fails)
+  save_state
 
   echo -e "${YELLOW}▶ Starting Xray...${NC}"
   systemctl enable xray >/dev/null 2>&1 || true
@@ -615,84 +668,28 @@ do_install() {
   echo -e "${GREEN}  ✓ Xray is running on port ${PORT}${NC}"
 
   local link
-  link="$(make_link "$UUID" "MyVPN")"
+  link="$(make_link "$UUID" "MyVPN")" || return 1
   save_info_file "$link"
   print_result "$link"
   log "INSTALL OK  ip=${SERVER_IP} port=${PORT}"
 }
 
-do_start() {
-  if ! xray_installed; then
-    echo -e "${RED}Xray is not installed. Choose 'Install' first.${NC}"
-    return 1
-  fi
-  if systemctl is-active --quiet xray; then
-    echo -e "${YELLOW}Xray is already running.${NC}"
-    return 0
-  fi
-  echo -e "${YELLOW}▶ Starting Xray...${NC}"
-  systemctl start xray
-  if wait_xray_active; then
-    echo -e "${GREEN}  ✓ Xray started.${NC}"
-  else
-    echo -e "${RED}  ✗ Failed to start Xray.${NC}"
-    journalctl -u xray -n 20 --no-pager
-    return 1
-  fi
-}
-
-do_stop() {
-  if ! xray_installed; then
-    echo -e "${RED}Xray is not installed.${NC}"
-    return 1
-  fi
-  echo -e "${YELLOW}▶ Stopping Xray...${NC}"
-  systemctl stop xray
-  if wait_xray_stopped; then
-    echo -e "${GREEN}  ✓ Xray stopped.${NC}"
-  else
-    echo -e "${RED}  ✗ Failed to stop Xray.${NC}"
-    return 1
-  fi
-}
-
-do_restart() {
-  if ! xray_installed; then
-    echo -e "${RED}Xray is not installed.${NC}"
-    return 1
-  fi
-  echo -e "${YELLOW}▶ Restarting Xray...${NC}"
-  systemctl restart xray
-  if wait_xray_active; then
-    echo -e "${GREEN}  ✓ Xray restarted.${NC}"
-  else
-    echo -e "${RED}  ✗ Failed to restart.${NC}"
-    journalctl -u xray -n 20 --no-pager
-    return 1
-  fi
-}
-
 do_show_link() {
-  if [ ! -f "$CONFIG" ]; then
-    echo -e "${RED}Config not found. Install first.${NC}"
+  if [ ! -f "$STATE_FILE" ] && [ ! -f "$CONFIG" ]; then
+    echo -e "${RED}Not installed. Install first.${NC}"
     return 1
   fi
 
   get_server_info
 
-  if [ -z "${UUID:-}" ] || [ -z "${PUBLIC_KEY:-}" ] || [ -z "${SERVER_IP:-}" ]; then
-    echo -e "${RED}Cannot build link — missing data.${NC}"
-    return 1
-  fi
-
   local link
-  link="$(make_link "$UUID" "MyVPN")"
+  link="$(make_link "$UUID" "MyVPN")" || return 1
   print_result "$link"
 }
 
 do_regenerate_keys() {
   if [ ! -f "$CONFIG" ]; then
-    echo -e "${RED}Config not found. Install first.${NC}"
+    echo -e "${RED}Not installed. Install first.${NC}"
     return 1
   fi
 
@@ -711,12 +708,10 @@ do_regenerate_keys() {
   fi
 
   UUID="$("$XRAY_CMD" uuid 2>/dev/null | tr -d '[:space:]')"
-  if [ -z "$UUID" ]; then
-    echo -e "${RED}  ✗ UUID generation failed.${NC}"
-    return 1
-  fi
+  SHORT_ID="$(openssl rand -hex 8)"
 
-  write_xray_config "$PORT" "$UUID" "$TARGET" "$PRIVATE_KEY"
+  write_xray_config "$PORT" "$UUID" "$TARGET" "$PRIVATE_KEY" "$SHORT_ID"
+  save_state
 
   echo -e "${YELLOW}▶ Restarting Xray...${NC}"
   systemctl restart xray
@@ -730,76 +725,10 @@ do_regenerate_keys() {
   echo -e "${GREEN}  ✓ Keys regenerated, Xray restarted.${NC}"
 
   local link
-  link="$(make_link "$UUID" "MyVPN")"
+  link="$(make_link "$UUID" "MyVPN")" || return 1
   save_info_file "$link"
   print_result "$link"
   log "REGEN KEYS  port=${PORT}"
-}
-
-do_change_port() {
-  if [ ! -f "$CONFIG" ]; then
-    echo -e "${RED}Config not found. Install first.${NC}"
-    return 1
-  fi
-
-  get_server_info
-  local old_port="$PORT"
-
-  echo -e "${YELLOW}Current port: ${old_port}${NC}"
-  echo ""
-  echo -e "${CYAN}  New port:${NC}"
-  echo -e "    1) ${BOLD}443${NC}  — standard HTTPS (best camouflage)"
-  echo -e "    2) Random high port (${PORT_MIN}-${PORT_MAX})"
-  echo -e "    3) Enter custom port"
-  echo ""
-  read -rp "$(echo -e "${YELLOW}  Choice [1]: ${NC}")" pc
-
-  case "${pc:-1}" in
-    1|"")
-      PORT="$DEFAULT_PORT"
-      ;;
-    2)
-      PORT="$(random_port)"
-      ;;
-    3)
-      read -rp "$(echo -e "${YELLOW}  Enter port: ${NC}")" cp
-      if [[ "$cp" =~ ^[0-9]+$ ]] && [ "$cp" -ge 1 ] && [ "$cp" -le 65535 ]; then
-        PORT="$cp"
-      else
-        echo -e "${RED}  ✗ Invalid port.${NC}"
-        return 1
-      fi
-      ;;
-    *) PORT="$DEFAULT_PORT" ;;
-  esac
-
-  if [ "$PORT" = "$old_port" ]; then
-    echo -e "${YELLOW}  Same port — nothing to change.${NC}"
-    return 0
-  fi
-
-  write_xray_config "$PORT" "$UUID" "$TARGET" "$PRIVATE_KEY"
-
-  # fix firewall
-  cleanup_old_ufw_vpn "$PORT"
-  ufw allow "${PORT}/tcp" comment 'VLESS-Reality' >/dev/null 2>&1
-
-  echo -e "${YELLOW}▶ Restarting Xray on port ${PORT}...${NC}"
-  systemctl restart xray
-
-  if ! wait_xray_active; then
-    echo -e "${RED}  ✗ Xray failed to start.${NC}"
-    journalctl -u xray -n 20 --no-pager
-    return 1
-  fi
-
-  echo -e "${GREEN}  ✓ Port changed: ${old_port} → ${PORT}${NC}"
-
-  local link
-  link="$(make_link "$UUID" "MyVPN")"
-  save_info_file "$link"
-  print_result "$link"
-  log "PORT CHANGE  ${old_port} -> ${PORT}"
 }
 
 do_uninstall() {
@@ -818,10 +747,9 @@ do_uninstall() {
   echo -e "${YELLOW}▶ Removing Xray binary...${NC}"
   bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) remove >> "$LOG_FILE" 2>&1 || true
 
-  rm -f "$CONFIG" "$INFO_FILE"
+  rm -f "$CONFIG" "$INFO_FILE" "$STATE_FILE"
 
   echo -e "${YELLOW}▶ Cleaning UFW rules...${NC}"
-  # remove only our VPN rules, keep SSH etc
   ufw status numbered 2>/dev/null | grep 'VLESS-Reality' | grep -oP '\d+(?=/tcp)' | sort -rn | while read -r p; do
     ufw delete allow "${p}/tcp" >/dev/null 2>&1 || true
   done
@@ -846,7 +774,6 @@ do_uninstall() {
 while true; do
   print_header
 
-  # Status line
   if systemctl is-active --quiet xray 2>/dev/null; then
     local_port="$(json_val '.inbounds[0].port' 2>/dev/null || echo '?')"
     echo -e "   Status : ${GREEN}● running${NC}  (port ${local_port})"
@@ -858,26 +785,18 @@ while true; do
 
   echo ""
   echo "   1)  Install + Start"
-  echo "   2)  Start"
-  echo "   3)  Stop"
-  echo "   4)  Restart"
-  echo "   5)  Show connection link"
-  echo "   6)  Regenerate keys (new UUID + keys)"
-  echo "   7)  Change port"
-  echo "   8)  Uninstall"
+  echo "   2)  Show connection link"
+  echo "   3)  Regenerate keys"
+  echo "   4)  Uninstall"
   echo "   0)  Exit"
   echo ""
-  read -rp "$(echo -e "${YELLOW}  Choice [0-8]: ${NC}")" choice
+  read -rp "$(echo -e "${YELLOW}  Choice [0-4]: ${NC}")" choice
 
   case "$choice" in
     1) do_install         ;;
-    2) do_start           ;;
-    3) do_stop            ;;
-    4) do_restart         ;;
-    5) do_show_link       ;;
-    6) do_regenerate_keys ;;
-    7) do_change_port     ;;
-    8) do_uninstall       ;;
+    2) do_show_link       ;;
+    3) do_regenerate_keys ;;
+    4) do_uninstall       ;;
     0) echo "Bye."; exit 0 ;;
     *) echo -e "${RED}Unknown option.${NC}" ;;
   esac

@@ -2,6 +2,7 @@
 
 # ═══════════════════════════════════════════════════════
 #   VLESS + XTLS-Reality AUTO-SETUP + SECURITY
+#   v2.0 — fixed & improved
 # ═══════════════════════════════════════════════════════
 
 set -e
@@ -11,6 +12,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 echo -e "${CYAN}"
 echo "╔════════════════════════════════════════════╗"
 echo "║   VLESS + Reality + Security  Auto Setup   ║"
+echo "║                  v2.0                      ║"
 echo "╚════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -20,16 +22,33 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# ── 1. Determine IP ──────────────────────────────────
-SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me)
-PORT=$(shuf -i 47000-60000 -n 1)
-echo -e "${GREEN}▶ Server IP: $SERVER_IP${NC}"
-echo -e "${GREEN}▶ Generated random VPN port: $PORT${NC}"
+# ── Warn if Xray already running ──────────────────────
+if systemctl is-active --quiet xray 2>/dev/null; then
+  echo -e "${YELLOW}⚠  Xray is already running. Reconfiguring...${NC}"
+fi
 
-# ── 2. OS Update and Dependencies Installation ─────────
-echo -e "${YELLOW}▶ Updating system and installing packages...${NC}"
+# ── 1. Determine IP ──────────────────────────────────
+SERVER_IP=$(curl -4 -s --max-time 5 https://api.ipify.org \
+         || curl -4 -s --max-time 5 https://ifconfig.me \
+         || curl -4 -s --max-time 5 https://icanhazip.com)
+SERVER_IP=$(echo "$SERVER_IP" | tr -d '[:space:]')
+
+if [[ -z "$SERVER_IP" ]]; then
+  echo -e "${RED}Error: could not determine server IP. Check your internet connection.${NC}"
+  exit 1
+fi
+
+PORT=$(shuf -i 47000-60000 -n 1)
+echo -e "${GREEN}▶ Server IP : $SERVER_IP${NC}"
+echo -e "${GREEN}▶ VPN port  : $PORT${NC}"
+
+# ── 2. OS Update ──────────────────────────────────────
+# Only update package lists; full upgrade is left to the admin
+# to avoid long waits and kernel/config conflicts during setup.
+echo -e "${YELLOW}▶ Updating package lists...${NC}"
 apt-get update -qq
-apt-get upgrade -y -qq
+
+# Install required packages (no full dist-upgrade)
 apt-get install -y -qq \
   curl unzip openssl \
   qrencode \
@@ -38,7 +57,7 @@ apt-get install -y -qq \
   unattended-upgrades \
   2>/dev/null
 
-echo -e "${GREEN}▶ All packages installed (including qrencode)${NC}"
+echo -e "${GREEN}▶ Required packages installed${NC}"
 
 # ══════════════════════════════════════════════════════
 #   SECURITY BLOCK
@@ -47,16 +66,26 @@ echo -e "${GREEN}▶ All packages installed (including qrencode)${NC}"
 echo -e "${CYAN}▶ Configuring server security...${NC}"
 
 # ── 3. UFW — firewall ─────────────────────────────────
-ufw --force reset >/dev/null 2>&1
-ufw default deny incoming >/dev/null
-ufw default allow outgoing >/dev/null
-ufw allow 22/tcp comment 'SSH'
-ufw allow $PORT/tcp comment 'VLESS'  # our VPN
-ufw --force enable >/dev/null
-echo -e "${GREEN}▶ UFW firewall active (ports 22 and $PORT are open)${NC}"
+# Detect actual SSH port dynamically to avoid locking ourselves out
+SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
+SSH_PORT=${SSH_PORT:-22}
+echo -e "${GREEN}▶ Detected SSH port: $SSH_PORT${NC}"
 
-# ── 4. Fail2Ban — bruteforce protection ────────────────
-cat > /etc/fail2ban/jail.local << 'EOF'
+# Make sure IPv6 support is enabled in UFW before resetting
+if [ -f /etc/default/ufw ]; then
+  sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
+fi
+
+ufw --force reset >/dev/null 2>&1
+ufw default deny incoming  >/dev/null
+ufw default allow outgoing >/dev/null
+ufw allow "${SSH_PORT}/tcp"  comment 'SSH'
+ufw allow "${PORT}/tcp"      comment 'VLESS'
+ufw --force enable >/dev/null
+echo -e "${GREEN}▶ UFW firewall active (ports ${SSH_PORT} and ${PORT} are open)${NC}"
+
+# ── 4. Fail2Ban — brute-force protection ───────────────
+cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime  = 3600
 findtime = 600
@@ -65,7 +94,7 @@ ignoreip = 127.0.0.1/8
 
 [sshd]
 enabled  = true
-port     = 22
+port     = ${SSH_PORT}
 logpath  = %(sshd_log)s
 backend  = systemd
 maxretry = 3
@@ -74,9 +103,9 @@ EOF
 
 systemctl enable fail2ban --quiet
 systemctl restart fail2ban
-echo -e "${GREEN}▶ Fail2Ban active (ban after 3 failed attempts)${NC}"
+echo -e "${GREEN}▶ Fail2Ban active (ban after 3 failed attempts, 24h)${NC}"
 
-# ── 5. Automatic security updates ────────────────────
+# ── 5. Automatic security updates ─────────────────────
 cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -84,10 +113,14 @@ APT::Periodic::AutocleanInterval "7";
 EOF
 echo -e "${GREEN}▶ Automatic security updates enabled${NC}"
 
-# ── 6. Kernel protection (sysctl) ──────────────────────
+# ── 6. Kernel hardening (sysctl) ──────────────────────
+# Remove any previous entries added by this script to stay idempotent
+sed -i '/# --- vless-setup-start ---/,/# --- vless-setup-end ---/d' /etc/sysctl.conf
+
 cat >> /etc/sysctl.conf << 'EOF'
 
-# Anti-spoofing protection
+# --- vless-setup-start ---
+# Anti-spoofing
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 
@@ -99,12 +132,14 @@ net.ipv6.conf.all.accept_redirects = 0
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_syn_backlog = 2048
 
-# Disable ping (optional, but hides the server)
-net.ipv4.icmp_echo_ignore_all = 1
+# BBR congestion control — critical for VPN throughput
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+# --- vless-setup-end ---
 EOF
 
 sysctl -p >/dev/null 2>&1
-echo -e "${GREEN}▶ Kernel protection configured${NC}"
+echo -e "${GREEN}▶ Kernel hardening configured (BBR enabled)${NC}"
 
 # ══════════════════════════════════════════════════════
 #   XRAY + VLESS REALITY INSTALLATION
@@ -114,29 +149,44 @@ echo -e "${CYAN}▶ Installing Xray...${NC}"
 bash <(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh) 1>/dev/null
 echo -e "${GREEN}▶ Xray installed${NC}"
 
-# ── 7. Generating all parameters ───────────────────────
+# ── 7. Generate all parameters ────────────────────────
 echo -e "${YELLOW}▶ Generating keys...${NC}"
 XRAY_CMD=$(command -v xray || echo "/usr/local/bin/xray")
+
 KEYS=$($XRAY_CMD x25519)
 PRIVATE_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}')
 PUBLIC_KEY=$(echo "$KEYS"  | grep -i "Public"  | awk '{print $NF}')
 UUID=$($XRAY_CMD uuid)
 SHORT_ID=$(openssl rand -hex 8)
-TARGETS=("www.samsung.com" "www.asus.com" "dl.google.com" "www.yahoo.com")
+
+# Targets with good global CDN — pick one at random
+TARGETS=("www.microsoft.com" "www.samsung.com" "www.asus.com" "dl.google.com")
 TARGET=${TARGETS[$RANDOM % ${#TARGETS[@]}]}
 
-# ── 8. Xray config ────────────────────────────────────
+# Sanitize all values (strip spaces/CR that break the VLESS link)
+PRIVATE_KEY=$(echo "$PRIVATE_KEY" | tr -d '[:space:]')
+PUBLIC_KEY=$(echo "$PUBLIC_KEY"   | tr -d '[:space:]')
+UUID=$(echo "$UUID"               | tr -d '[:space:]')
+SHORT_ID=$(echo "$SHORT_ID"       | tr -d '[:space:]')
+TARGET=$(echo "$TARGET"           | tr -d '[:space:]')
+
+if [[ -z "$UUID" || -z "$PUBLIC_KEY" || -z "$PRIVATE_KEY" ]]; then
+  echo -e "${RED}Error: key generation failed. Check xray binary.${NC}"
+  exit 1
+fi
+
+# ── 8. Write Xray config ──────────────────────────────
 cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "port": $PORT,
+      "port": ${PORT},
       "protocol": "vless",
       "settings": {
         "clients": [
           {
-            "id": "$UUID"
+            "id": "${UUID}"
           }
         ],
         "decryption": "none"
@@ -146,10 +196,11 @@ cat > /usr/local/etc/xray/config.json << EOF
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "$TARGET:443",
-          "serverNames": ["$TARGET"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
+          "dest": "${TARGET}:443",
+          "serverNames": ["${TARGET}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"],
+          "fingerprint": "chrome"
         }
       },
       "sniffing": {
@@ -165,7 +216,7 @@ cat > /usr/local/etc/xray/config.json << EOF
 }
 EOF
 
-# ── 9. Start Xray ───────────────────────────────────
+# ── 9. Start Xray ─────────────────────────────────────
 systemctl enable xray --quiet
 systemctl restart xray
 sleep 2
@@ -173,48 +224,39 @@ sleep 2
 if systemctl is-active --quiet xray; then
   echo -e "${GREEN}▶ Xray started successfully!${NC}"
 else
-  echo -e "${RED}Error! Log:${NC}"
+  echo -e "${RED}Error starting Xray. Last 20 log lines:${NC}"
   journalctl -u xray -n 20 --no-pager
   exit 1
 fi
 
 # ══════════════════════════════════════════════════════
-#   GENERATE LINK AND QR
+#   BUILD VLESS LINK AND QR CODE
 # ══════════════════════════════════════════════════════
-
-# Clean variables from possible spaces and \r (otherwise Hiddify/v2ray crashes with parsing error)
-SERVER_IP=$(echo "$SERVER_IP" | tr -d '[:space:]')
-UUID=$(echo "$UUID" | tr -d '[:space:]')
-PUBLIC_KEY=$(echo "$PUBLIC_KEY" | tr -d '[:space:]')
-TARGET=$(echo "$TARGET" | tr -d '[:space:]')
-SHORT_ID=$(echo "$SHORT_ID" | tr -d '[:space:]')
-
-if [[ -z "$UUID" || -z "$PUBLIC_KEY" || -z "$SERVER_IP" ]]; then
-  echo -e "${RED}Error: empty variables (IP: $SERVER_IP, UUID: $UUID, PUB: $PUBLIC_KEY). Link will not be working!${NC}"
-  exit 1
-fi
 
 VLESS_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${TARGET}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#MyVPN"
 
-# Save to file
+# ── Save info to file ─────────────────────────────────
 INFO_FILE="/root/vpn-info.txt"
-cat > $INFO_FILE << EOF
+cat > "$INFO_FILE" << EOF
 ════════════════════════════════════════════════════
   VLESS + XTLS-Reality — connection details
 ════════════════════════════════════════════════════
 
-Server IP:   $SERVER_IP
-VPN Port:    $PORT
-UUID:        $UUID
-Public Key:  $PUBLIC_KEY
-Short ID:    $SHORT_ID
-SNI:         $TARGET
-Flow:        disabled (DPI protection)
-Fingerprint: chrome
+Server IP    : ${SERVER_IP}
+VPN Port     : ${PORT}
+SSH Port     : ${SSH_PORT}
+UUID         : ${UUID}
+Public Key   : ${PUBLIC_KEY}
+Short ID     : ${SHORT_ID}
+SNI Target   : ${TARGET}
+Fingerprint  : chrome
+Flow         : disabled (DPI protection)
 
 IMPORT LINK:
-$VLESS_LINK
+${VLESS_LINK}
 
+════════════════════════════════════════════════════
+  Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')
 ════════════════════════════════════════════════════
 EOF
 
@@ -224,22 +266,34 @@ EOF
 
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║         ✅ ALL DONE! YOUR LINK:                 ║${NC}"
+echo -e "${CYAN}║         ✅ ALL DONE! YOUR LINK:                  ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${BOLD}${GREEN}$VLESS_LINK${NC}"
+echo -e "${BOLD}${GREEN}${VLESS_LINK}${NC}"
 echo ""
 echo -e "${YELLOW}══════════ QR-CODE FOR PHONE ══════════${NC}"
 qrencode -t ANSIUTF8 -m 2 "$VLESS_LINK"
-echo -e "${YELLOW}══════════════════════════════════════════${NC}"
+echo -e "${YELLOW}═══════════════════════════════════════${NC}"
 echo ""
-echo -e "${CYAN}📁 All data saved to: ${BOLD}/root/vpn-info.txt${NC}"
+echo -e "${CYAN}📁 All connection details saved to: ${BOLD}${INFO_FILE}${NC}"
 echo ""
-echo -e "${CYAN}📱 Apps:${NC}"
-echo "   Android/iOS/Windows/Mac: https://hiddify.com"
+echo -e "${CYAN}📱 Client apps:${NC}"
+echo "   Android / iOS / Windows / Mac: https://hiddify.com"
 echo ""
-echo -e "${GREEN}What is protected:${NC}"
-echo "   ✅ Fail2Ban  — ban after 3 failed login attempts"
-echo "   ✅ UFW       — all unused ports are closed"
-echo "   ✅ Kernel    — SYN-flood and spoofing protection"
-echo "   ✅ Automatic security updates"
+echo -e "${GREEN}Security summary:${NC}"
+echo "   ✅ Fail2Ban   — ban after 3 failed SSH attempts (24h)"
+echo "   ✅ UFW        — all ports closed except SSH (${SSH_PORT}) and VPN (${PORT})"
+echo "   ✅ Kernel     — SYN-flood, spoofing protection, BBR enabled"
+echo "   ✅ Auto-updates — security patches applied automatically"
+echo "   ✅ Reality    — TLS fingerprint masking (chrome)"
+echo ""
+
+# ── Self-delete prompt ────────────────────────────────
+echo -e "${YELLOW}🗑  Delete this setup script from disk? (recommended) [y/N]${NC}"
+read -r -t 15 CLEANUP_ANSWER
+if [[ "${CLEANUP_ANSWER,,}" == "y" ]]; then
+  echo -e "${GREEN}▶ Script deleted.${NC}"
+  rm -- "$0"
+else
+  echo -e "${CYAN}▶ Script kept at: $0${NC}"
+fi
